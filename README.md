@@ -37,6 +37,7 @@ This repository is built for the following reference hardware stack:
 Install via pip:
 ```bash
 pip install -r requirements.txt
+```
 
 ### Arduino Libraries
 * `Adafruit ADS1X15`
