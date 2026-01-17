@@ -1,0 +1,28 @@
+__pycache__/
+python_scripts/__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+
+venv/
+env/
+.env
+
+build/
+
+.DS_Store
+Thumbs.db
+
+.vscode/
+
+# downloaded data files of pressure graphs
+*.csv 
+
+# programmed robot actions
+action library/*.json
+
+# default graph settings
+python scripts/graphic_settings.json
+
+# manual word document
+Manual.docx
