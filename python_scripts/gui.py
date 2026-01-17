@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial.tools.list_ports
-from communication import SerialCommunication
+from .communication import SerialCommunication
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -1999,8 +1999,3 @@ class PneumaticGUI:
         self.parse_and_store_target(zero_cmd) # Update targets
             
         window.destroy()
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = PneumaticGUI(root)
-    root.mainloop()

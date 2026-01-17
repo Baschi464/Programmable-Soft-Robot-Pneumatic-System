@@ -56,7 +56,7 @@ pip install -r requirements.txt
 1.  Navigate to the project directory.
 2.  Run the main script:
     ```bash
-    python main_gui.py
+    python main.py
     ```
 3.  Select your COM port from the dropdown and click **Connect**.
 4.  Use the "Trajectory Editor" to draw your gait or load a preset JSON file.

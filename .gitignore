@@ -19,10 +19,10 @@ Thumbs.db
 *.csv 
 
 # programmed robot actions
-action library/*.json
+action_library/*.json
 
 # default graph settings
-python scripts/graphic_settings.json
+python_scripts/graphic_settings.json
 
 # manual word document
 Manual.docx
