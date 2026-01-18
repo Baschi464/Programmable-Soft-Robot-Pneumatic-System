@@ -78,7 +78,7 @@ class PneumaticGUI:
         self._prog_pick_cycle_index = 0
         
         # Path to Action Library (json files storage)
-        self.action_lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "action library"))
+        self.action_lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "action_library"))
         if not os.path.exists(self.action_lib_path):
             try:
                 os.makedirs(self.action_lib_path)
@@ -137,7 +137,7 @@ class PneumaticGUI:
 
     def open_manual(self):
         """Opens manual.pdf located in the same directory as the action library folder."""
-        # action_lib_path points to ".../action library"
+        # action_lib_path points to ".../action_library"
         # We look for ".../manual.pdf" (sibling of the folder)
         parent_dir = os.path.dirname(self.action_lib_path)
         manual_path = os.path.join(parent_dir, "manual.pdf")
@@ -1268,7 +1268,7 @@ class PneumaticGUI:
             messagebox.showerror("Error", f"Failed to save file: {e}")
 
     def refresh_action_library(self):
-        """Reloads actions from the 'action library' folder."""
+        """Reloads actions from the 'action_library' folder."""
         # Clear both lists if they exist
         if hasattr(self, 'action_listbox'):
             self.action_listbox.delete(0, tk.END)
@@ -1641,7 +1641,7 @@ class PneumaticGUI:
             return
 
         # Prepare path
-        # 'graphs' folder is sibling to 'action library'
+        # 'graphs' folder is sibling to 'action_library'
         graphs_dir = os.path.join(os.path.dirname(self.action_lib_path), "graphs")
         if not os.path.exists(graphs_dir):
             try:
