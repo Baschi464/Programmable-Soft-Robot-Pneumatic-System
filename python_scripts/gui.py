@@ -380,13 +380,13 @@ class PneumaticGUI:
                 self.current_action_indices = []
                 return
 
-            # For each channel (1 to num_channels)
             for i in range(self.num_channels):
                 ch_times = times_by_channel[i] if i < len(times_by_channel) else []
                 ch_pressures = pressures_by_channel[i] if i < len(pressures_by_channel) else []
 
                 if not ch_times:
-                    current_targets.append(0.0)
+                    # Channel has no keypoints → send "off" token
+                    current_targets.append("off")
                     continue
 
                 idx = indices_by_channel[i] if i < len(indices_by_channel) else 0
@@ -399,11 +399,18 @@ class PneumaticGUI:
                 if i < len(indices_by_channel):
                     indices_by_channel[i] = idx
 
-                current_targets.append(ch_pressures[idx] if idx < len(ch_pressures) else 0.0)
+                p_val = ch_pressures[idx] if idx < len(ch_pressures) else 0.0
+                if isinstance(p_val, str):
+                    # Toggle keypoint: "off" or "on" (on resumes at 0.0)
+                    current_targets.append("off" if p_val == "off" else "0.0")
+                else:
+                    current_targets.append(p_val)
 
             # Send ONE targets command per tick (all channels)
-            # Format: <p1,p2,p3,...>
-            cmd_str = "<" + ",".join([f"{p:.1f}" for p in current_targets]) + ">"
+            # Format: <p1,p2,p3,...>  — channels with no keypoints send "off"
+            cmd_str = "<" + ",".join(
+                [str(p) if isinstance(p, str) else f"{p:.1f}" for p in current_targets]
+            ) + ">"
             if self.comm:
                 ok = self.comm.send_command(cmd_str)
                 if not ok and getattr(self.comm, 'disconnected', False):
@@ -421,6 +428,12 @@ class PneumaticGUI:
                 self.current_action_times = []
                 self.current_action_pressures = []
                 self.current_action_indices = []
+                
+                # Send all-off so channels don't hold their last targets
+                off_cmd = "<" + ",".join(["off"] * self.num_channels) + ">"
+                if self.comm:
+                    self.comm.send_command(off_cmd)
+                self.parse_and_store_target(off_cmd)
                 
                 # Remove from UI Queue (Head is at index 0)
                 if self.queue_listbox.size() > 0:
@@ -457,8 +470,11 @@ class PneumaticGUI:
                     for pt in raw_points:
                         try:
                             t = float(pt[0])
-                            p = float(pt[1])
-                            processed.append((t, p))
+                            p_val = pt[1]
+                            if isinstance(p_val, str) and p_val in ("off", "on"):
+                                processed.append((t, p_val))
+                            else:
+                                processed.append((t, float(p_val)))
                         except (TypeError, ValueError, IndexError):
                             continue
 
@@ -476,21 +492,6 @@ class PneumaticGUI:
                 self.action_queue.pop(0)
                 if self.queue_listbox.size() > 0:
                     self.queue_listbox.delete(0)
-
-    def get_step_pressure(self, points, t):
-        """Returns the pressure of the most recent keypoint (Step Function)."""
-        if not points:
-            return 0.0
-            
-        # Find the last point where point.time <= t
-        last_p = 0.0
-        for pt in points:
-            if pt[0] <= t:
-                last_p = pt[1]
-            else:
-                # Since points are sorted, we can stop early
-                break
-        return last_p
 
     def get_action_details(self, action_name):
         """Loads action data from the JSON file."""
@@ -664,6 +665,21 @@ class PneumaticGUI:
         self.btn_delete_pt = ttk.Button(frame_edit, text="Delete Keypoint", command=self.delete_keypoint, state="disabled")
         self.btn_delete_pt.pack(fill=tk.X, padx=5, pady=(0, 5))
 
+        # Toggle OFF / ON buttons — only require time, not pressure
+        frame_toggle = ttk.LabelFrame(controls, text="Channel Toggle (OFF / ON)")
+        frame_toggle.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(frame_toggle, text="Adds a toggle keypoint at the time entered above.").pack(pady=2)
+
+        toggle_btn_row = ttk.Frame(frame_toggle)
+        toggle_btn_row.pack(fill=tk.X, padx=5, pady=5)
+
+        self.btn_toggle_off = ttk.Button(toggle_btn_row, text="Set OFF at Time", command=self.add_toggle_off_keypoint)
+        self.btn_toggle_off.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+
+        self.btn_toggle_on = ttk.Button(toggle_btn_row, text="Set ON at Time", command=self.add_toggle_on_keypoint)
+        self.btn_toggle_on.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+
         # --- Action Library (Program Tab) ---
         frame_lib = ttk.LabelFrame(controls, text="Action Library")
         frame_lib.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -761,9 +777,16 @@ class PneumaticGUI:
             try:
                 ch_idx = int(ch_str) - 1 # Convert "1" -> 0
                 if 0 <= ch_idx < 20:
-                    # Ensure points are tuples/lists of floats
-                    self.current_program[ch_idx] = [(float(p[0]), float(p[1])) for p in points]
-            except ValueError:
+                    loaded = []
+                    for p in points:
+                        t_val = float(p[0])
+                        p_val = p[1]
+                        if isinstance(p_val, str) and p_val in ("off", "on"):
+                            loaded.append((t_val, p_val))
+                        else:
+                            loaded.append((t_val, float(p_val)))
+                    self.current_program[ch_idx] = loaded
+            except (ValueError, TypeError, IndexError):
                 pass
                 
         self.update_program_graph()
@@ -1037,8 +1060,10 @@ class PneumaticGUI:
                 continue
 
             for pt_idx, (t, p) in enumerate(points):
+                # Toggle keypoints are drawn at y=0 on the graph
+                plot_p = 0 if isinstance(p, str) else p
                 try:
-                    sx, sy = transform((t, p))
+                    sx, sy = transform((t, plot_p))
                 except Exception:
                     continue
 
@@ -1078,7 +1103,10 @@ class PneumaticGUI:
         self.ent_prog_time.delete(0, tk.END)
         self.ent_prog_time.insert(0, str(t))
         self.ent_prog_pressure.delete(0, tk.END)
-        self.ent_prog_pressure.insert(0, str(p))
+        if isinstance(p, str):
+            self.ent_prog_pressure.insert(0, p.upper())  # "OFF" or "ON"
+        else:
+            self.ent_prog_pressure.insert(0, str(p))
 
         # Set state
         self.selected_keypoint = {'channel': ch_idx, 'original_t': t, 'original_p': p}
@@ -1101,7 +1129,7 @@ class PneumaticGUI:
         if ch_idx in self.current_program:
             self.current_program[ch_idx] = [
                 pt for pt in self.current_program[ch_idx]
-                if not (abs(pt[0] - orig_t) < 1e-5 and abs(pt[1] - orig_p) < 1e-5)
+                if not self._keypoint_matches(pt, orig_t, orig_p)
             ]
 
         # Clear selection state
@@ -1134,16 +1162,13 @@ class PneumaticGUI:
             
         # If editing, remove the old point first
         if hasattr(self, 'selected_keypoint') and self.selected_keypoint:
-            # Verify we are editing the same channel, otherwise treat as new add
             if self.selected_keypoint['channel'] == ch_idx:
                 orig_t = self.selected_keypoint['original_t']
                 orig_p = self.selected_keypoint['original_p']
                 
-                # Remove the specific point
-                # Note: Floating point comparison needs tolerance
                 self.current_program[ch_idx] = [
-                    pt for pt in self.current_program[ch_idx] 
-                    if not (abs(pt[0] - orig_t) < 1e-5 and abs(pt[1] - orig_p) < 1e-5)
+                    pt for pt in self.current_program[ch_idx]
+                    if not self._keypoint_matches(pt, orig_t, orig_p)
                 ]
                 
                 # Reset state
@@ -1170,6 +1195,59 @@ class PneumaticGUI:
         self.ent_prog_time.delete(0, tk.END)
         self.ent_prog_pressure.delete(0, tk.END)
 
+    @staticmethod
+    def _keypoint_matches(pt, orig_t, orig_p):
+        """Returns True if keypoint `pt` matches the given time and pressure/toggle value."""
+        if abs(pt[0] - orig_t) >= 1e-5:
+            return False
+        if isinstance(orig_p, str):
+            return pt[1] == orig_p
+        return isinstance(pt[1], (int, float)) and abs(pt[1] - orig_p) < 1e-5
+
+    def _add_toggle_keypoint(self, toggle_type):
+        """Shared logic for adding an 'off' or 'on' toggle keypoint at the given time."""
+        try:
+            t = float(self.ent_prog_time.get())
+            if t < 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Invalid Input", "Please enter a valid time (seconds).")
+            return
+
+        ch_idx = self.combo_prog_channel.current()
+        if ch_idx == -1:
+            return
+
+        if ch_idx not in self.current_program:
+            self.current_program[ch_idx] = []
+
+        # Remove any existing keypoint at this exact time for this channel
+        self.current_program[ch_idx] = [
+            pt for pt in self.current_program[ch_idx]
+            if abs(pt[0] - t) >= 1e-5
+        ]
+
+        self.current_program[ch_idx].append((t, toggle_type))
+        self.current_program[ch_idx].sort(key=lambda x: x[0])
+
+        # Clear selection
+        self.selected_keypoint = None
+        self.btn_add_pt.config(text="Add Keypoint")
+        if hasattr(self, 'btn_delete_pt'):
+            self.btn_delete_pt.config(state="disabled")
+
+        self.update_program_graph()
+        self.ent_prog_time.delete(0, tk.END)
+        self.ent_prog_pressure.delete(0, tk.END)
+
+    def add_toggle_off_keypoint(self):
+        """Inserts an 'off' toggle keypoint at the specified time."""
+        self._add_toggle_keypoint("off")
+
+    def add_toggle_on_keypoint(self):
+        """Inserts an 'on' toggle keypoint at the specified time."""
+        self._add_toggle_keypoint("on")
+
     def update_program_graph(self):
         """Redraws the preview graph in the program tab."""
         self.ax_prog.clear()
@@ -1183,25 +1261,70 @@ class PneumaticGUI:
         # Only plot channels that have points
         for ch_idx, points in self.current_program.items():
             if not points: continue
-            # Only plot valid channels for current config
             if ch_idx >= self.num_channels: continue
             
-            # Check visibility
             if hasattr(self, 'prog_vis_vars') and not self.prog_vis_vars[ch_idx].get():
                 continue
             
-            ts = [pt[0] for pt in points]
-            ps = [pt[1] for pt in points]
-            line, = self.ax_prog.plot(
-                ts,
-                ps,
-                marker='o',
-                drawstyle='steps-post',
-                label=f"Ch {ch_idx+1}",
-                picker=5
-            )
-            line.set_gid(ch_idx)
-            if ts: max_t = max(max_t, max(ts))
+            # Separate pressure keypoints from toggle keypoints
+            pressure_pts = [(t, p) for t, p in points if isinstance(p, (int, float))]
+            off_pts = [t for t, p in points if p == "off"]
+            on_pts  = [t for t, p in points if p == "on"]
+            
+            # Get color from the default color cycle for this channel
+            color = None  # will be assigned by the first plot call
+
+            # Plot pressure curve (step function) with markers
+            if pressure_pts:
+                ts = [pt[0] for pt in pressure_pts]
+                ps = [pt[1] for pt in pressure_pts]
+                line, = self.ax_prog.plot(
+                    ts, ps,
+                    marker='o',
+                    drawstyle='steps-post',
+                    label=f"Ch {ch_idx+1}",
+                    picker=5
+                )
+                line.set_gid(ch_idx)
+                color = line.get_color()
+                if ts: max_t = max(max_t, max(ts))
+            else:
+                # Channel has only toggle points — still pick a color
+                color = f"C{ch_idx % 10}"
+            
+            # Plot OFF toggle markers (triangle-down)
+            if off_pts:
+                self.ax_prog.plot(
+                    off_pts, [0] * len(off_pts),
+                    marker='v', markersize=10, linestyle='None',
+                    color=color, markeredgecolor='red', markeredgewidth=1.5,
+                    label=f"Ch {ch_idx+1} OFF" if not pressure_pts else None
+                )
+                max_t = max(max_t, max(off_pts))
+
+            # Plot ON toggle markers (triangle-up)
+            if on_pts:
+                self.ax_prog.plot(
+                    on_pts, [0] * len(on_pts),
+                    marker='^', markersize=10, linestyle='None',
+                    color=color, markeredgecolor='green', markeredgewidth=1.5,
+                    label=f"Ch {ch_idx+1} ON" if not pressure_pts else None
+                )
+                max_t = max(max_t, max(on_pts))
+
+            # Draw shaded OFF regions
+            all_sorted = sorted(points, key=lambda pt: pt[0])
+            off_start = None
+            for t_pt, val in all_sorted:
+                if val == "off":
+                    off_start = t_pt
+                elif off_start is not None:
+                    # Any non-off keypoint ends the off region
+                    self.ax_prog.axvspan(off_start, t_pt, alpha=0.08, color=color)
+                    off_start = None
+            # If still off at the end, shade to max_t
+            if off_start is not None and max_t > off_start:
+                self.ax_prog.axvspan(off_start, max_t, alpha=0.08, color=color)
             
         if max_t > 0:
             self.ax_prog.set_xlim(0, max_t * 1.1)
@@ -1232,9 +1355,20 @@ class PneumaticGUI:
         for i in range(self.num_channels):
             points = self.current_program.get(i, [])
             export_points = [list(pt) for pt in points]
-            
-            if not export_points:
-                export_points = [[0.0, 0.0], [total_duration, 0.0]]
+
+            # Check if channel has ANY pressure keypoints (not just toggles)
+            has_pressure = any(isinstance(pt[1], (int, float)) for pt in points)
+            has_any = len(export_points) > 0
+
+            if not has_any:
+                # No keypoints at all → will be auto-detected as off by execution
+                # Don't pad with zeros; leave empty so automatic off detection works.
+                final_channels[str(i+1)] = []
+            elif not has_pressure:
+                # Only toggle keypoints, no pressure values → pad start if needed
+                if export_points[0][0] > 0:
+                    export_points.insert(0, [0.0, 0.0])  # start active at 0 until first toggle
+                final_channels[str(i+1)] = export_points
             else:
                 if export_points[0][0] > 0:
                     export_points.insert(0, [0.0, 0.0])
@@ -1243,7 +1377,7 @@ class PneumaticGUI:
                 if last_t < total_duration:
                     export_points.append([total_duration, last_p])
                     
-            final_channels[str(i+1)] = export_points
+                final_channels[str(i+1)] = export_points
 
         # 3. Create JSON structure
         action_data = {
@@ -1882,14 +2016,19 @@ class PneumaticGUI:
         self.canvas.draw_idle()
 
     def parse_and_store_target(self, cmd):
-        """Parses a command string <v1,v2...> and updates current_targets."""
+        """Parses a command string <v1,v2...> and updates current_targets.
+        Tokens that are 'off' are stored as NaN so the plotter breaks the target line."""
         if cmd.startswith('<') and cmd.endswith('>'):
             content = cmd[1:-1]
             try:
-                vals = [float(x) for x in content.split(',')]
-                for i, v in enumerate(vals):
+                parts = content.split(',')
+                for i, tok in enumerate(parts):
                     if i < len(self.current_targets):
-                        self.current_targets[i] = v
+                        tok = tok.strip()
+                        if tok.lower() == 'off':
+                            self.current_targets[i] = float('nan')
+                        else:
+                            self.current_targets[i] = float(tok)
             except:
                 pass
 

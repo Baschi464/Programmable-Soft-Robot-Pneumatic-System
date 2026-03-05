@@ -1,0 +1,3 @@
+* text=auto
+*.ino text eol=lf
+*.py  text eol=lf
