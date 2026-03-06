@@ -11,13 +11,13 @@
 const float DEFAULT_TARGET = 0.0;
 
 // --- SMC DEFAULT GAINS (Applied to all channels initially) ---
-const float DEF_LAMBDA       = 20.0;   // Sliding surface gain ("Braking Strength")
+const float DEF_LAMBDA        = 18.0;   // Sliding surface gain ("Braking Strength")
 const float DEF_PHI           = 40.0;   // Boundary layer thickness
 const float DEF_K_GAIN        = 100.0;   // Base Speed multiplier
 const float DEF_KD_GAIN       = 0.0;    // Derivative multiplier
-const float DEF_P_TOLERANCE   = 0.5;    // Deadband (kPa)
+const float DEF_P_TOLERANCE   = 1.0;    // Deadband (kPa)
 const float DEF_PASSIVE_THR   = 0.8;    // If |sat| < this, use passive vent instead of pump
-const float DEF_VENT_BOOST    = 4.0;   // Multiplier for passive vent duration
+const float DEF_VENT_GAIN     = 2.0;   // Multiplier for passive vent duration
 const float DEF_ATMOSPHERIC_P = 0.5;    // Approx atmospheric pressure (kPa)
 
 // --- TIMING & PULSE LIMITS ---
@@ -35,7 +35,7 @@ const float P_MAX_KPA   = 100.0;
 const float V_SPAN = V_FULLSCALE - V_OFFSET;
 const float P_SPAN = P_MAX_KPA - P_MIN_KPA;
 // --- INDIVIDUAL SENSOR OFFSETS (Calibration) ---
-float SENSOR_OFFSETS[8] = { -0.91, -0.68, -0.65, 0.0, 0.0, 0.0, 0.0, 0.0 };
+float SENSOR_OFFSETS[8] = { -0.73, -0.69, -0.72, -0.67, -0.64, -0.85, -0.58, -0.53 };
 
 // --- PINS (USER TO CONFIGURE) ---
 // Shared Pumps
@@ -102,8 +102,14 @@ struct ChannelControl {
   float kd_gain;            // Derivative multiplier
   float p_tolerance;        // Deadband (kPa)
   float passive_threshold;  // |sat| below this → passive vent
-  float vent_boost_gain;    // Multiplier for passive vent pulse
+  float vent_gain;          // Multiplier for passive vent pulse
   float atmospheric_p;      // Reference for passive vent decision
+
+  // --- Debug snapshot (recorded during IDLE decision, read at telemetry time) ---
+  float dbg_error;
+  float dbg_sat;
+  unsigned long dbg_pulse;
+  // currentMode already captures the action taken
 };
 
 // --- GLOBAL OBJECTS ---
@@ -111,12 +117,16 @@ ChannelControl channels[8];
 Adafruit_ADS1115 ads1; // Address 0x48 (Channels 0-3)
 Adafruit_ADS1115 ads2; // Address 0x49 (Channels 4-7)
 
+// --- DEBUG FLAG  ---
+const bool DEBUG_TELEMETRY = false;
+
 // --- COMMUNICATION VARIABLES ---
 const byte numChars = 128;
 char receivedChars[numChars];
 boolean newData = false;
 unsigned long lastTelemetryTime = 0;
 const long TELEMETRY_INTERVAL = 100; // 10 Hz updates to Python
+unsigned long loopStartTime = 0;     // For measuring loop duration
 
 // ==========================================================================
 //   HELPER FUNCTIONS
@@ -261,7 +271,7 @@ void setup() {
     channels[i].currentPulseDuration = 0;
     channels[i].reqPosPump         = false;
     channels[i].reqNegPump         = false;
-    channels[i].isOff              = false;
+    channels[i].isOff              = true;   // All channels OFF until GUI sends targets
 
     // SMC internal state
     channels[i].prev_error     = 0.0;
@@ -273,6 +283,11 @@ void setup() {
     channels[i].p_history[2] = 0.0;
     channels[i].history_initialized = false;
 
+    // Debug snapshot init
+    channels[i].dbg_error = 0.0;
+    channels[i].dbg_sat   = 0.0;
+    channels[i].dbg_pulse = 0;
+
     // --- Assign Default SMC Gains (can be overridden per channel below) ---
     channels[i].lambda_smc        = DEF_LAMBDA;
     channels[i].phi               = DEF_PHI;
@@ -280,7 +295,7 @@ void setup() {
     channels[i].kd_gain           = DEF_KD_GAIN;
     channels[i].p_tolerance       = DEF_P_TOLERANCE;
     channels[i].passive_threshold = DEF_PASSIVE_THR;
-    channels[i].vent_boost_gain   = DEF_VENT_BOOST;
+    channels[i].vent_gain         = DEF_VENT_GAIN;
     channels[i].atmospheric_p     = DEF_ATMOSPHERIC_P;
   }
 
@@ -297,8 +312,6 @@ void setup() {
 
   ads1.setGain(GAIN_TWOTHIRDS);
   ads2.setGain(GAIN_TWOTHIRDS);
-  ads1.setDataRate(RATE_ADS1115_860SPS);
-  ads2.setDataRate(RATE_ADS1115_860SPS);
 
   Serial.println("<ARDUINO_READY_8CH>");
 }
@@ -307,6 +320,7 @@ void setup() {
 //   MAIN LOOP
 // ==========================================================================
 void loop() {
+  loopStartTime = millis();
 
   // 1. COMMUNICATION (Receive Targets from Python GUI)
   recvWithStartEndMarkers();
@@ -322,20 +336,7 @@ void loop() {
   for (int i = 0; i < 8; i++) {
     ChannelControl &ch = channels[i];
 
-    // A. Read Sensor
-    ch.currentPressure = getCleanPressure(i);
-
-    // --- SAFETY: Sensor disconnect ---
-    if (ch.currentPressure == -1000.0) {
-      digitalWrite(ch.pinValvePos, LOW);
-      digitalWrite(ch.pinValveNeg, LOW);
-      ch.currentState = STATE_IDLE;
-      ch.currentMode  = MODE_IDLE;
-      continue;
-    }
-
-    // --- OFF CHANNEL: no keypoints in current action → skip control entirely ---
-    // Valves stay closed, no pump request, but sensor is still read for telemetry.
+    // --- OFF CHANNEL: skip sensor read and control entirely ---
     if (ch.isOff) {
       digitalWrite(ch.pinValvePos, LOW);
       digitalWrite(ch.pinValveNeg, LOW);
@@ -343,6 +344,16 @@ void loop() {
       ch.currentMode  = MODE_IDLE;
       ch.prev_error   = 0.0;
       ch.history_initialized = false;
+      continue;
+    }
+
+    // A. Read Sensor
+    ch.currentPressure = getCleanPressure(i);
+
+    // Safety: sensor disconnected / wire break → close valves, skip control
+    if (ch.currentPressure == -1000.0) {
+      digitalWrite(ch.pinValvePos, LOW);
+      digitalWrite(ch.pinValveNeg, LOW);
       continue;
     }
 
@@ -407,6 +418,11 @@ void loop() {
         unsigned long pulse_width = (unsigned long)(fabs(sat) * ch.k_gain);
         if (pulse_width > (unsigned long)MAX_PULSE) pulse_width = MAX_PULSE;
 
+        // --- Record debug snapshot ---
+        ch.dbg_error = error;
+        ch.dbg_sat   = sat;
+        ch.dbg_pulse = pulse_width;
+
         // ============================================================
         //  INFLATION  (sat > 0)
         // ============================================================
@@ -438,7 +454,7 @@ void loop() {
               ch.currentMode = MODE_PASSIVE_DEF;
               digitalWrite(ch.pinValvePos, LOW);
               digitalWrite(ch.pinValveNeg, HIGH);
-              ch.currentPulseDuration = (unsigned long)(pulse_width * ch.vent_boost_gain);
+              ch.currentPulseDuration = (unsigned long)(pulse_width * (ch.vent_gain / ch.currentPressure));
               if (ch.currentPulseDuration > (unsigned long)MAX_PULSE) ch.currentPulseDuration = MAX_PULSE;
               ch.currentState   = STATE_DEFLATING_PASSIVE;
               ch.stateStartTime = millis();
@@ -466,36 +482,53 @@ void loop() {
       // ================================================================
       //  INFLATING — Positive valve open, pump on if needed
       // ================================================================
-      case STATE_INFLATING:
+      case STATE_INFLATING: {
         if (ch.currentPulseDuration >= (unsigned long)MIN_PUMP_PULSE) ch.reqPosPump = true;
 
-        if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
-          if (ch.currentMode == MODE_COARSE_INF) {
-            ch.currentState = STATE_IDLE; // Keep valve open, skip rest
-          } else {
+        // COARSE mode: keep valve open but monitor live pressure.
+        // Once error shrinks below coarse exit threshold, close valve and rest
+        // to prevent overshooting into a COARSE+/COARSE- limit cycle.
+        if (ch.currentMode == MODE_COARSE_INF) {
+          float liveError = ch.targetPressure - ch.currentPressure;
+          if (liveError <= ch.p_tolerance) {
+            // Close enough — stop and let pressure settle
             digitalWrite(ch.pinValvePos, LOW);
             ch.currentState   = STATE_RESTING;
             ch.stateStartTime = millis();
           }
+          // Otherwise keep valve open, stay in this state
+        }
+        else if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
+          digitalWrite(ch.pinValvePos, LOW);
+          ch.currentState   = STATE_RESTING;
+          ch.stateStartTime = millis();
         }
         break;
+      }
 
       // ================================================================
       //  DEFLATING (Active) — Negative valve + vacuum pump
       // ================================================================
-      case STATE_DEFLATING_ACTIVE:
+      case STATE_DEFLATING_ACTIVE: {
         if (ch.currentPulseDuration >= (unsigned long)MIN_PUMP_PULSE) ch.reqNegPump = true;
 
-        if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
-          if (ch.currentMode == MODE_COARSE_DEF) {
-            ch.currentState = STATE_IDLE; // Keep valve open, skip rest
-          } else {
+        // COARSE mode: keep valve open but monitor live pressure.
+        if (ch.currentMode == MODE_COARSE_DEF) {
+          float liveError = ch.targetPressure - ch.currentPressure;
+          if (liveError >= -ch.p_tolerance) {
+            // Close enough — stop and let pressure settle
             digitalWrite(ch.pinValveNeg, LOW);
             ch.currentState   = STATE_RESTING;
             ch.stateStartTime = millis();
           }
         }
+        else if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
+          digitalWrite(ch.pinValveNeg, LOW);
+          ch.currentState   = STATE_RESTING;
+          ch.stateStartTime = millis();
+        }
         break;
+      }
 
       // ================================================================
       //  DEFLATING (Passive) — Negative valve only, no pump
@@ -545,5 +578,26 @@ void loop() {
       if (i < 7) Serial.print(",");
     }
     Serial.println();
+
+    // --- DEBUG TELEMETRY (one line per active channel) ---
+    // Format: DBG:ch,tgt,act,err,sat,pulse,mode,loopMs
+    // GUI ignores these (only parses ACT: lines).
+    // Open Serial Monitor to see them.
+    if (DEBUG_TELEMETRY) {
+      unsigned long loopMs = millis() - loopStartTime;
+      for (int i = 0; i < 8; i++) {
+        if (channels[i].isOff) continue;
+        if (channels[i].currentPressure == -1000.0) continue;
+        Serial.print("DBG:");
+        Serial.print(i);                             Serial.print(",");
+        Serial.print(channels[i].targetPressure, 1); Serial.print(",");
+        Serial.print(channels[i].currentPressure, 2);Serial.print(",");
+        Serial.print(channels[i].dbg_error, 2);      Serial.print(",");
+        Serial.print(channels[i].dbg_sat, 3);        Serial.print(",");
+        Serial.print(channels[i].dbg_pulse);          Serial.print(",");
+        Serial.print(channels[i].currentMode);        Serial.print(",");
+        Serial.println(loopMs);
+      }
+    }
   }
 }

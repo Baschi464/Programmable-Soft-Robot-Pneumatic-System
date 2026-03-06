@@ -66,6 +66,9 @@ class PneumaticGUI:
         self.current_action_duration = 0.0 # Duration of current action
         self.action_start_time = 0
 
+        # --- Post-action hold: keep last targets alive for N seconds after action ends ---
+        self.post_action_hold_until = 0.0   # time.time() when hold expires (0 = inactive)
+
         # Tracks the currently selected library action (Program tab)
         self.selected_library_action_name = None
 
@@ -421,7 +424,18 @@ class PneumaticGUI:
 
             # Check if finished
             if elapsed >= self.current_action_duration:
-                print(f"Action '{self.current_action}' finished.")
+                # Flush the final targets into the plot data NOW, before all-off
+                # overwrites current_targets with NaN.
+                current_time = time.time() - self.start_time - self.total_paused_time
+                for i in range(min(self.num_channels, len(self.channel_data))):
+                    tgt = self.current_targets[i] if i < len(self.current_targets) else 0.0
+                    self.channel_data[i]['t'].append(current_time)
+                    self.channel_data[i]['target'].append(tgt)
+                    # Use last known actual value so the actual line isn't broken
+                    last_actual = self.channel_data[i]['actual'][-1] if self.channel_data[i]['actual'] else float('nan')
+                    self.channel_data[i]['actual'].append(last_actual)
+
+                print(f"Action '{self.current_action}' finished. Holding targets for 2s...")
                 self.current_action = None
                 self.current_action_data = None # Clear cache
                 self.current_action_channels = {}
@@ -429,11 +443,9 @@ class PneumaticGUI:
                 self.current_action_pressures = []
                 self.current_action_indices = []
                 
-                # Send all-off so channels don't hold their last targets
-                off_cmd = "<" + ",".join(["off"] * self.num_channels) + ">"
-                if self.comm:
-                    self.comm.send_command(off_cmd)
-                self.parse_and_store_target(off_cmd)
+                # Start a 2-second hold: channels keep their last targets.
+                # all-off will be sent when the timer expires (see below).
+                self.post_action_hold_until = time.time() + 2.0
                 
                 # Remove from UI Queue (Head is at index 0)
                 if self.queue_listbox.size() > 0:
@@ -443,7 +455,26 @@ class PneumaticGUI:
                 if self.action_queue:
                     self.action_queue.pop(0)
         
-        # If no action is running, check if there is one waiting
+        # --- Post-action hold timer: send all-off once the hold expires ---
+        if self.post_action_hold_until > 0 and not self.current_action:
+            if time.time() >= self.post_action_hold_until:
+                off_cmd = "<" + ",".join(["off"] * self.num_channels) + ">"
+                if self.comm:
+                    self.comm.send_command(off_cmd)
+                self.parse_and_store_target(off_cmd)
+                self.post_action_hold_until = 0.0
+                print("Post-action hold expired. Channels off.")
+            else:
+                # Keep re-sending current targets so Arduino doesn't time-out
+                # (current_targets still holds the last action values)
+                cmd_str = "<" + ",".join(
+                    [str(p) if isinstance(p, str) else f"{p:.1f}"
+                     for p in self.current_targets[:self.num_channels]]
+                ) + ">"
+                if self.comm:
+                    self.comm.send_command(cmd_str)
+        
+        # If no action is running and hold timer is done (or queue has a new action to override), check if there is one waiting
         if not self.current_action and self.action_queue:
             # Start the next action (FIFO -> Index 0)
             next_action = self.action_queue[0]
@@ -455,8 +486,9 @@ class PneumaticGUI:
                 self.current_action = next_action
                 self.current_action_data = action_data # Cache it
                 self.current_action_channels = action_data.get("channels", {})
-                self.current_action_duration = action_data.get("total_duration", 0.0)
+                self.current_action_duration = action_data.get("total_duration", 0.0) + 0.5  # +0.5s grace so the last keypoint is held long enough
                 self.action_start_time = now
+                self.post_action_hold_until = 0.0  # Cancel any active hold timer
 
                 # Pre-process keypoints once (float-convert + sort by time) for efficient execution.
                 self.current_action_times = [[] for _ in range(self.num_channels)]
@@ -1454,8 +1486,14 @@ class PneumaticGUI:
         lbl_lib = ttk.Label(sidebar, text="Action Library", font=("Arial", 10, "bold"))
         lbl_lib.pack(pady=(5, 0))
         
-        self.action_listbox = tk.Listbox(sidebar, height=8)
-        self.action_listbox.pack(fill=tk.X, padx=5, pady=5)
+        lib_frame = ttk.Frame(sidebar)
+        lib_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.action_listbox = tk.Listbox(lib_frame, height=11)
+        lib_scrollbar = ttk.Scrollbar(lib_frame, orient=tk.VERTICAL, command=self.action_listbox.yview)
+        self.action_listbox.configure(yscrollcommand=lib_scrollbar.set)
+        self.action_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lib_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # Note: Population happens in refresh_action_library()
 
@@ -1856,6 +1894,10 @@ class PneumaticGUI:
 
                 # Connection successful -> allow future warnings again
                 self.hardware_disconnected_warned = False
+
+                # Send all-off so every channel is dormant until an action starts
+                off_cmd = "<" + ",".join(["off"] * self.num_channels) + ">"
+                self.comm.send_command(off_cmd)
                 
                 # Update UI
                 self.btn_connect.config(text="Disconnect")
