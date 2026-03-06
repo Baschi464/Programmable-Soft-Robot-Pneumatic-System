@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
+#include <SPI.h>
 
 // ==========================================================================
 //   8-CHANNEL PNEUMATIC CONTROLLER - SMC (Sliding Mode Control)
@@ -10,17 +11,17 @@
 const float DEFAULT_TARGET = 0.0;
 
 // --- SMC DEFAULT GAINS (Applied to all channels initially) ---
-const float DEF_LAMBDA       = 2.5;    // Sliding surface gain ("Braking Strength" — increase if overshooting)
-const float DEF_PHI           = 8.0;    // Boundary layer thickness (increase for smoother/slower approach)
-const float DEF_K_GAIN        = 1000.0; // Max pulse duration in ms (base speed)
+const float DEF_LAMBDA       = 20.0;   // Sliding surface gain ("Braking Strength")
+const float DEF_PHI           = 40.0;   // Boundary layer thickness
+const float DEF_K_GAIN        = 100.0;   // Base Speed multiplier
+const float DEF_KD_GAIN       = 0.0;    // Derivative multiplier
 const float DEF_P_TOLERANCE   = 0.5;    // Deadband (kPa)
-const float DEF_PASSIVE_THR   = 0.4;    // If |sat| < this, use passive vent instead of pump
-const float DEF_VENT_BOOST    = 1.5;    // Multiplier for passive vent duration (slower than active)
-const float DEF_ATMOSPHERIC_P = 0.0;    // Approx atmospheric pressure (kPa)
+const float DEF_PASSIVE_THR   = 0.8;    // If |sat| < this, use passive vent instead of pump
+const float DEF_VENT_BOOST    = 4.0;   // Multiplier for passive vent duration
+const float DEF_ATMOSPHERIC_P = 0.5;    // Approx atmospheric pressure (kPa)
 
 // --- TIMING & PULSE LIMITS ---
-const int REST_TIME       = 200;  // Settling time after fine pulse (ms)
-const int COARSE_REST     = 10;   // Minimal rest after coarse (saturated) pulse (ms)
+const int REST_TIME       = 200;  // Settle time for fine tuning (ms)
 const int MIN_PULSE       = 10;   // Shortest possible valve opening (ms)
 const int MIN_PUMP_PULSE  = 30;   // Don't turn on pump for tiny pulses to save motor
 const int MAX_PULSE       = 2000; // Safety cap (ms)
@@ -38,12 +39,12 @@ float SENSOR_OFFSETS[8] = { -0.91, -0.68, -0.65, 0.0, 0.0, 0.0, 0.0, 0.0 };
 
 // --- PINS (USER TO CONFIGURE) ---
 // Shared Pumps
-const int PIN_PUMP_POS = 12;
-const int PIN_PUMP_NEG = 13;
+const int PIN_PUMP_POS = 13;
+const int PIN_PUMP_NEG = 12;
 
 // Valve Arrays (Index 0 = Channel 1, etc.)
-const int VALVES_POS[8] = { 2, 40, 40, 40, 40, 40, 40, 40 };
-const int VALVES_NEG[8] = { 35, 40, 40, 40, 40, 40, 40, 40 };
+const int VALVES_POS[8] = { 42, 44, 46, 48, 50, 52, 51, 53 };
+const int VALVES_NEG[8] = { 36, 34, 32, 30, 28, 26, 24, 22 };
 
 // --- STATE ENUM ---
 enum ControlState {
@@ -89,12 +90,16 @@ struct ChannelControl {
   // --- SMC Internal State (per channel) ---
   float prev_error;
   unsigned long last_loop_time;
-  float last_sat;           // Stored for rest-time decision
+
+  // --- Median Filter State (per channel) ---
+  float p_history[3];
+  bool history_initialized;
 
   // --- Per-Channel SMC Gains ---
   float lambda_smc;         // Sliding surface gain
   float phi;                // Boundary layer thickness
-  float k_gain;             // Max pulse duration (ms)
+  float k_gain;             // Base Speed multiplier
+  float kd_gain;            // Derivative multiplier
   float p_tolerance;        // Deadband (kPa)
   float passive_threshold;  // |sat| below this → passive vent
   float vent_boost_gain;    // Multiplier for passive vent pulse
@@ -117,15 +122,25 @@ const long TELEMETRY_INTERVAL = 100; // 10 Hz updates to Python
 //   HELPER FUNCTIONS
 // ==========================================================================
 
-// --- Read Pressure (Selects correct ADS module) ---
+// --- Read Pressure (Selects correct ADS module & input) ---
+//   Ch0→ads2[3], Ch1→ads2[2], Ch2→ads2[1], Ch3→ads2[0]
+//   Ch4→ads1[0], Ch5→ads1[1], Ch6→ads1[2], Ch7→ads1[3]
 float readPressure(int chIndex) {
-  int16_t raw;
+  int16_t raw = 0;
+  bool validChannel = true;
 
-  if (chIndex < 4) {
-    raw = ads1.readADC_SingleEnded(chIndex);
-  } else {
-    raw = ads2.readADC_SingleEnded(chIndex - 4);
+  switch (chIndex) {
+    case 0: raw = ads2.readADC_SingleEnded(3); break;
+    case 1: raw = ads2.readADC_SingleEnded(2); break;
+    case 2: raw = ads2.readADC_SingleEnded(1); break;
+    case 3: raw = ads2.readADC_SingleEnded(0); break;
+    case 4: raw = ads1.readADC_SingleEnded(0); break;
+    case 5: raw = ads1.readADC_SingleEnded(1); break;
+    case 6: raw = ads1.readADC_SingleEnded(2); break;
+    case 7: raw = ads1.readADC_SingleEnded(3); break;
+    default: validChannel = false; break;
   }
+  if (!validChannel) return -1000.0;
 
   float voltage = raw * ADS_BIT_VOLTAGE;
   if (voltage < 0.2) return -1000.0; // Wire break / disconnected
@@ -136,17 +151,34 @@ float readPressure(int chIndex) {
   return kpa;
 }
 
-// --- Mode Name (for logging) ---
-String getModeName(ControlMode m) {
-  switch (m) {
-    case MODE_IDLE:        return "IDLE";
-    case MODE_COARSE_INF:  return "COARSE_+";
-    case MODE_COARSE_DEF:  return "COARSE_-";
-    case MODE_FINE_INF:    return "FINE_+";
-    case MODE_FINE_DEF:    return "FINE_-";
-    case MODE_PASSIVE_DEF: return "PASSIVE_V";
-    default:               return "?";
+// --- Median-Filtered Pressure (per channel) ---
+float getCleanPressure(int chIndex) {
+  ChannelControl &ch = channels[chIndex];
+  float raw_reading = readPressure(chIndex);
+  if (raw_reading == -1000.0) return raw_reading;
+
+  if (!ch.history_initialized) {
+    ch.p_history[0] = ch.p_history[1] = ch.p_history[2] = raw_reading;
+    ch.history_initialized = true;
+  } else {
+    ch.p_history[2] = ch.p_history[1];
+    ch.p_history[1] = ch.p_history[0];
+    ch.p_history[0] = raw_reading;
   }
+
+  float median_val;
+  if ((ch.p_history[0] <= ch.p_history[1] && ch.p_history[1] <= ch.p_history[2]) || 
+      (ch.p_history[2] <= ch.p_history[1] && ch.p_history[1] <= ch.p_history[0])) {
+    median_val = ch.p_history[1];
+  } 
+  else if ((ch.p_history[1] <= ch.p_history[0] && ch.p_history[0] <= ch.p_history[2]) || 
+           (ch.p_history[2] <= ch.p_history[0] && ch.p_history[0] <= ch.p_history[1])) {
+    median_val = ch.p_history[0];
+  } 
+  else {
+    median_val = ch.p_history[2];
+  }
+  return median_val;
 }
 
 // --- Serial Parsing (Matches Python GUI Format) ---
@@ -177,24 +209,9 @@ void recvWithStartEndMarkers() {
 }
 
 void parseData() {
-  char *strtokIndx;
-  strtokIndx = strtok(receivedChars, ",");
+  char *strtokIndx = strtok(receivedChars, ",");
 
-  if (strtokIndx != NULL) {
-    if (strcmp(strtokIndx, "off") == 0) {
-      channels[0].isOff = true;
-    } else {
-      if (channels[0].isOff) {
-        // Transitioning off → on: reset SMC state to avoid derivative spike
-        channels[0].last_loop_time = millis();
-        channels[0].prev_error = 0.0;
-      }
-      channels[0].isOff = false;
-      channels[0].targetPressure = atof(strtokIndx);
-    }
-  }
-  for (int i = 1; i < 8; i++) {
-    strtokIndx = strtok(NULL, ",");
+  for (int i = 0; i < 8; i++) {
     if (strtokIndx != NULL) {
       if (strcmp(strtokIndx, "off") == 0) {
         channels[i].isOff = true;
@@ -203,11 +220,13 @@ void parseData() {
           // Transitioning off → on: reset SMC state to avoid derivative spike
           channels[i].last_loop_time = millis();
           channels[i].prev_error = 0.0;
+          channels[i].history_initialized = false;
         }
         channels[i].isOff = false;
         channels[i].targetPressure = atof(strtokIndx);
       }
     }
+    strtokIndx = strtok(NULL, ",");
   }
 }
 
@@ -247,12 +266,18 @@ void setup() {
     // SMC internal state
     channels[i].prev_error     = 0.0;
     channels[i].last_loop_time = now;
-    channels[i].last_sat       = 0.0;
+
+    // Median filter state
+    channels[i].p_history[0] = 0.0;
+    channels[i].p_history[1] = 0.0;
+    channels[i].p_history[2] = 0.0;
+    channels[i].history_initialized = false;
 
     // --- Assign Default SMC Gains (can be overridden per channel below) ---
     channels[i].lambda_smc        = DEF_LAMBDA;
     channels[i].phi               = DEF_PHI;
     channels[i].k_gain            = DEF_K_GAIN;
+    channels[i].kd_gain           = DEF_KD_GAIN;
     channels[i].p_tolerance       = DEF_P_TOLERANCE;
     channels[i].passive_threshold = DEF_PASSIVE_THR;
     channels[i].vent_boost_gain   = DEF_VENT_BOOST;
@@ -260,16 +285,10 @@ void setup() {
   }
 
   // ==========================================================================
-  // --- EXAMPLE: CUSTOM SMC TUNING FOR A SPECIFIC CHANNEL ---
-  //
-  // channels[3].lambda_smc        = 3.0;   // Stronger braking (default 2.5)
-  // channels[3].phi               = 10.0;  // Wider boundary → smoother (default 8.0)
-  // channels[3].k_gain            = 800.0; // Lower max pulse (default 1000)
-  // channels[3].p_tolerance       = 0.3;   // Tighter deadband (default 0.5)
-  // channels[3].passive_threshold = 0.5;   // More passive venting (default 0.4)
-  // channels[3].vent_boost_gain   = 2.0;   // Longer passive pulses (default 1.5)
-  //
-  // All other channels still use the defaults defined above.
+  // --- CUSTOM SMC TUNING FOR A SPECIFIC CHANNEL ---
+  
+    channels[0].p_tolerance       = 20.0;   // suction cup channel
+    channels[1].p_tolerance       = 20.0;   // suction cup channel
   // ==========================================================================
 
   // Initialize Sensors
@@ -304,7 +323,7 @@ void loop() {
     ChannelControl &ch = channels[i];
 
     // A. Read Sensor
-    ch.currentPressure = readPressure(i);
+    ch.currentPressure = getCleanPressure(i);
 
     // --- SAFETY: Sensor disconnect ---
     if (ch.currentPressure == -1000.0) {
@@ -323,6 +342,7 @@ void loop() {
       ch.currentState = STATE_IDLE;
       ch.currentMode  = MODE_IDLE;
       ch.prev_error   = 0.0;
+      ch.history_initialized = false;
       continue;
     }
 
@@ -337,26 +357,46 @@ void loop() {
       //  IDLE — Compute SMC law, decide next action
       // ================================================================
       case STATE_IDLE: {
-        // --- Time delta ---
         unsigned long current_time = millis();
-        float dt = (current_time - ch.last_loop_time) / 1000.0; // seconds
-        if (dt <= 0.001) dt = 0.001; // protect against zero-division
+        float dt = (current_time - ch.last_loop_time) / 1000.0;
+
+        // --- BRAIN SPEED LIMIT ---
+        if (dt < 0.05) break;
 
         float error = ch.targetPressure - ch.currentPressure;
+        bool should_sleep = false;
 
-        // --- Deadband ---
-        if (abs(error) <= ch.p_tolerance) {
-          ch.currentMode  = MODE_IDLE;
-          ch.prev_error   = error;
+        // --- SUCTION CUP LOGIC ---
+        if (ch.targetPressure <= -5.0) {
+          if (ch.currentMode == MODE_IDLE) {
+            // Resting: only wake up if we leak OUTSIDE the deadband
+            if (abs(error) <= ch.p_tolerance) should_sleep = true;
+          } else {
+            // Actively deflating: IGNORE the deadband,
+            // keep pumping until we actually hit or cross the target
+            if (ch.currentPressure <= ch.targetPressure) should_sleep = true;
+          }
+        }
+        // --- STANDARD POSITIVE PRESSURE LOGIC ---
+        else {
+          if (abs(error) <= ch.p_tolerance) should_sleep = true;
+        }
+
+        // --- EXECUTE SLEEP ---
+        if (should_sleep) {
+          digitalWrite(ch.pinValvePos, LOW);
+          digitalWrite(ch.pinValveNeg, LOW);
+          ch.currentMode = MODE_IDLE;
+          ch.prev_error = error;
           ch.last_loop_time = current_time;
-          break; // nothing to do
+          break;
         }
 
         // --- Error derivative ---
         float error_dot = (error - ch.prev_error) / dt;
 
-        // --- Sliding surface ---
-        float s = (ch.lambda_smc * error) + error_dot;
+        // --- Sliding surface (with derivative gain) ---
+        float s = (ch.lambda_smc * error) + (ch.kd_gain * error_dot);
 
         // --- Saturation function (clamp to [-1, +1]) ---
         float sat = s / ch.phi;
@@ -366,18 +406,18 @@ void loop() {
         // --- Pulse width ---
         unsigned long pulse_width = (unsigned long)(fabs(sat) * ch.k_gain);
         if (pulse_width > (unsigned long)MAX_PULSE) pulse_width = MAX_PULSE;
-        ch.last_sat = sat;
 
         // ============================================================
         //  INFLATION  (sat > 0)
         // ============================================================
         if (sat > 0) {
           if (pulse_width > (unsigned long)MIN_PULSE) {
-            ch.currentMode = (fabs(sat) >= 0.95) ? MODE_COARSE_INF : MODE_FINE_INF;
+            if (pulse_width < (unsigned long)MIN_PUMP_PULSE) pulse_width = MIN_PUMP_PULSE;
+            ch.currentMode = (fabs(sat) >= 0.85) ? MODE_COARSE_INF : MODE_FINE_INF;
 
             digitalWrite(ch.pinValveNeg, LOW);
             digitalWrite(ch.pinValvePos, HIGH);
-            if (pulse_width > (unsigned long)MIN_PUMP_PULSE) ch.reqPosPump = true;
+            if (pulse_width >= (unsigned long)MIN_PUMP_PULSE) ch.reqPosPump = true;
 
             ch.currentPulseDuration = pulse_width;
             ch.currentState   = STATE_INFLATING;
@@ -391,24 +431,24 @@ void loop() {
           if (pulse_width > (unsigned long)MIN_PULSE) {
             // Decide passive vs active venting
             bool usePassive = (fabs(sat) < ch.passive_threshold) &&
-                              (ch.currentPressure > ch.atmospheric_p + 2.0);
+                              (ch.currentPressure > ch.atmospheric_p);
 
             if (usePassive) {
               // --- Passive Vent (valve only, no pump) ---
               ch.currentMode = MODE_PASSIVE_DEF;
               digitalWrite(ch.pinValvePos, LOW);
               digitalWrite(ch.pinValveNeg, HIGH);
-
               ch.currentPulseDuration = (unsigned long)(pulse_width * ch.vent_boost_gain);
               if (ch.currentPulseDuration > (unsigned long)MAX_PULSE) ch.currentPulseDuration = MAX_PULSE;
               ch.currentState   = STATE_DEFLATING_PASSIVE;
               ch.stateStartTime = millis();
             } else {
               // --- Active Vacuum (valve + pump) ---
-              ch.currentMode = (fabs(sat) >= 0.95) ? MODE_COARSE_DEF : MODE_FINE_DEF;
+              if (pulse_width < (unsigned long)MIN_PUMP_PULSE) pulse_width = MIN_PUMP_PULSE;
+              ch.currentMode = (fabs(sat) >= 0.85) ? MODE_COARSE_DEF : MODE_FINE_DEF;
               digitalWrite(ch.pinValvePos, LOW);
               digitalWrite(ch.pinValveNeg, HIGH);
-              if (pulse_width > (unsigned long)MIN_PUMP_PULSE) ch.reqNegPump = true;
+              if (pulse_width >= (unsigned long)MIN_PUMP_PULSE) ch.reqNegPump = true;
 
               ch.currentPulseDuration = pulse_width;
               ch.currentState   = STATE_DEFLATING_ACTIVE;
@@ -427,12 +467,16 @@ void loop() {
       //  INFLATING — Positive valve open, pump on if needed
       // ================================================================
       case STATE_INFLATING:
-        if (ch.currentPulseDuration > (unsigned long)MIN_PUMP_PULSE) ch.reqPosPump = true;
+        if (ch.currentPulseDuration >= (unsigned long)MIN_PUMP_PULSE) ch.reqPosPump = true;
 
         if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
-          digitalWrite(ch.pinValvePos, LOW);
-          ch.currentState   = STATE_RESTING;
-          ch.stateStartTime = millis();
+          if (ch.currentMode == MODE_COARSE_INF) {
+            ch.currentState = STATE_IDLE; // Keep valve open, skip rest
+          } else {
+            digitalWrite(ch.pinValvePos, LOW);
+            ch.currentState   = STATE_RESTING;
+            ch.stateStartTime = millis();
+          }
         }
         break;
 
@@ -440,12 +484,16 @@ void loop() {
       //  DEFLATING (Active) — Negative valve + vacuum pump
       // ================================================================
       case STATE_DEFLATING_ACTIVE:
-        if (ch.currentPulseDuration > (unsigned long)MIN_PUMP_PULSE) ch.reqNegPump = true;
+        if (ch.currentPulseDuration >= (unsigned long)MIN_PUMP_PULSE) ch.reqNegPump = true;
 
         if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
-          digitalWrite(ch.pinValveNeg, LOW);
-          ch.currentState   = STATE_RESTING;
-          ch.stateStartTime = millis();
+          if (ch.currentMode == MODE_COARSE_DEF) {
+            ch.currentState = STATE_IDLE; // Keep valve open, skip rest
+          } else {
+            digitalWrite(ch.pinValveNeg, LOW);
+            ch.currentState   = STATE_RESTING;
+            ch.stateStartTime = millis();
+          }
         }
         break;
 
@@ -455,9 +503,7 @@ void loop() {
       case STATE_DEFLATING_PASSIVE:
         // No pump request — physics does the work
         if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
-          digitalWrite(ch.pinValveNeg, LOW);
-          ch.currentState   = STATE_RESTING;
-          ch.stateStartTime = millis();
+          ch.currentState = STATE_IDLE;
         }
         break;
 
@@ -468,12 +514,7 @@ void loop() {
         digitalWrite(ch.pinValvePos, LOW);
         digitalWrite(ch.pinValveNeg, LOW);
 
-        // Shorter rest when saturated (coarse), longer when fine-tuning
-        unsigned long restDuration = (fabs(ch.last_sat) >= 0.95)
-                                       ? (unsigned long)COARSE_REST
-                                       : (unsigned long)REST_TIME;
-
-        if (millis() - ch.stateStartTime >= restDuration) {
+        if (millis() - ch.stateStartTime >= (unsigned long)REST_TIME) {
           ch.currentState = STATE_IDLE;
         }
         break;

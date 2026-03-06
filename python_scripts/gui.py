@@ -1889,8 +1889,7 @@ class PneumaticGUI:
             self.is_paused = True
             self.last_pause_timestamp = time.time()
             self.btn_pause.config(text="RESUME", bg="green", fg="white")
-            if hasattr(self, 'btn_download_graph'):
-                self.btn_download_graph.config(state="normal")
+            self.btn_download_graph.config(state="normal")
             
             # Hold Pressure
             currents = self.latest_pressures[:self.num_channels]
@@ -1951,8 +1950,7 @@ class PneumaticGUI:
                 self.action_start_time += paused_duration
             
             self.btn_pause.config(text="PAUSE", bg="orange", fg="black")
-            if hasattr(self, 'btn_download_graph'):
-                self.btn_download_graph.config(state="disabled")
+            self.btn_download_graph.config(state="disabled")
             self.history_frame.pack_forget() # Hide scrollbar
             
             # Reset view to live
