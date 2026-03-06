@@ -302,8 +302,8 @@ void setup() {
   // ==========================================================================
   // --- CUSTOM SMC TUNING FOR A SPECIFIC CHANNEL ---
   
-    channels[0].p_tolerance       = 20.0;   // suction cup channel
-    channels[1].p_tolerance       = 20.0;   // suction cup channel
+    channels[0].p_tolerance       = 10.0;   // suction cup channel
+    channels[1].p_tolerance       = 10.0;   // suction cup channel
   // ==========================================================================
 
   // Initialize Sensors
@@ -377,11 +377,17 @@ void loop() {
         float error = ch.targetPressure - ch.currentPressure;
         bool should_sleep = false;
 
+        // --- ADAPTIVE TOLERANCE LOGIC ---
+        float currentTolerance = ch.p_tolerance; // Default
+        if (ch.targetPressure <= -5.0) {
+            currentTolerance = 20.0; // Wide tolerance for vacuum
+        }
+
         // --- SUCTION CUP LOGIC ---
         if (ch.targetPressure <= -5.0) {
           if (ch.currentMode == MODE_IDLE) {
             // Resting: only wake up if we leak OUTSIDE the deadband
-            if (abs(error) <= ch.p_tolerance) should_sleep = true;
+            if (abs(error) <= currentTolerance) should_sleep = true;
           } else {
             // Actively deflating: IGNORE the deadband,
             // keep pumping until we actually hit or cross the target
@@ -390,7 +396,7 @@ void loop() {
         }
         // --- STANDARD POSITIVE PRESSURE LOGIC ---
         else {
-          if (abs(error) <= ch.p_tolerance) should_sleep = true;
+          if (abs(error) <= currentTolerance) should_sleep = true;
         }
 
         // --- EXECUTE SLEEP ---
