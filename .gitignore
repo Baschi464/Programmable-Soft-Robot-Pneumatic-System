@@ -29,7 +29,6 @@ action_library/*.json
 # default graph settings
 python_scripts/graphic_settings.json
 
-# manual word document
-Manual.docx
-
+/docs/manual
+/graphs/*
 

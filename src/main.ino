@@ -303,7 +303,7 @@ void setup() {
   // --- CUSTOM SMC TUNING FOR A SPECIFIC CHANNEL ---
   
     channels[0].p_tolerance       = 10.0;   // suction cup channel
-    channels[1].p_tolerance       = 10.0;   // suction cup channel
+    channels[5].p_tolerance       = 10.0;   // suction cup channel
   // ==========================================================================
 
   // Initialize Sensors
@@ -520,12 +520,22 @@ void loop() {
 
         // COARSE mode: keep valve open but monitor live pressure.
         if (ch.currentMode == MODE_COARSE_DEF) {
-          float liveError = ch.targetPressure - ch.currentPressure;
-          if (liveError >= -ch.p_tolerance) {
-            // Close enough — stop and let pressure settle
-            digitalWrite(ch.pinValveNeg, LOW);
-            ch.currentState   = STATE_RESTING;
-            ch.stateStartTime = millis();
+          if (ch.targetPressure <= -5.0) {
+            // Suction cup target: keep valve open, go straight to IDLE.
+            // The suction cup logic in IDLE ignores the deadband and
+            // keeps pumping until currentPressure <= targetPressure.
+            if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
+              ch.currentState = STATE_IDLE;  // Valve stays open!
+            }
+          } else {
+            // Standard COARSE: monitor live pressure to prevent overshoot
+            float liveError = ch.targetPressure - ch.currentPressure;
+            if (liveError >= -ch.p_tolerance) {
+              // Close enough — stop and let pressure settle
+              digitalWrite(ch.pinValveNeg, LOW);
+              ch.currentState   = STATE_RESTING;
+              ch.stateStartTime = millis();
+            }
           }
         }
         else if (millis() - ch.stateStartTime >= ch.currentPulseDuration) {
